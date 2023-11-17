@@ -1,0 +1,332 @@
+Организация многозадачности в ядре ОС
+Волею судеб мне довелось разбираться с организацией многозадачности, точнее псевдо-многозадачности, поскольку задачи делят время на одном ядре процессора. Я уже несколько раз встречала на хабре статьи по данной теме, и мне показалось, что данная тема сообществу интересна, поэтому я позволю себе внести свою скромную лепту в освещение данного вопроса.
+Сначала я попытаюсь рассказать о типах многозадачности (кооперативной и вытесняющей). Затем перейду к принципам планирования для вытесняющей многозадачности. Рассказ рассчитан скорее на начинающего читателя, который хочет разобраться, как работает многозадачность на уровне ядра ОС. Но поскольку все будет сопровождаться примерами, которые можно скомпилировать, запустить, и с которыми при желании можно поиграться, то, возможно, статья заинтересует и тех, кто уже знаком с теорией, но никогда не пробовал планировщик “на вкус”. Кому лень читать, может сразу перейти к изучению кода, поскольку код примеров будет взят из нашего проекта.
+Ну, и многопоточные котики для привлечения внимания.
+
+
+
+
+Введение
+
+Сперва определимся, что означает термин “многозадачность”. Вот определение из русской Википедии:
+
+Многозада?чность (англ. multitasking) — свойство операционной системы или среды программирования обеспечивать возможность параллельной (или псевдопараллельной) обработки нескольких процессов.
+
+Английская дает, на мой взгляд, менее понятное, но более развернутое определение:
+
+In computing, multitasking is a method where multiple tasks, also known as processes, are performed during the same period of time. The tasks share common processing resources, such as a CPU and main memory. In the case of a computer with a single CPU, only one task is said to be running at any point in time, meaning that the CPU is actively executing instructions for that task. Multitasking solves the problem by scheduling which task may be the one running at any given time, and when another waiting task gets a turn. The act of reassigning a CPU from one task to another one is called a context switch.
+
+В нем вводится понятие разделение ресурсов (resources sharing) и, собственно, планирование (scheduling). Именно о планировании (в первую очередь, процессорного времени) и пойдет речь в данной статье. В обоих определениях речь идет о планировании процессов, но я буду рассказывать о планировании на основе потоков.
+
+Таким образом, нам необходимо ввести еще одно понятие, назовем его поток исполнения — это набор инструкций с определенным порядком следования, которые выполняет процессор во время работы программы.
+Поскольку речь идет о многозадачности, то естественно в системе может быть несколько этих самых вычислительных потоков. Поток, инструкции которого процессор выполняет в данный момент времени, называется активным. Поскольку на одном процессорном ядре может в один момент времени выполняться только одна инструкция, то активным может быть только один вычислительный поток. Процесс выбора активного вычислительного потока называется планированием (scheduling). В свою очередь, модуль, который отвечает за данный выбор принято называть планировщиком (scheduler).
+
+Существует много различных методов планирования. Большинство из них можно отнести к двум основным типам:
+
+невытесняющие (кооперативные) — планировщик не может забрать время у вычислительного потока, пока тот сам его не отдаст
+вытесняющие — планировщик по истечении кванта времени выбирает следующий активный вычислительный поток, сам вычислительный поток также может отдать предназначенный для него остаток кванта времени
+
+
+Давайте начнем разбираться с невытесняющего метода планирования, так как его очень просто можно реализовать.
+
+
+Невытесняющий планировщик
+
+Рассматриваемый невытесняющий планировщик очень простой, данный материал дан для начинающих, чтобы было проще разобраться в многозадачности. Тот, кто имеет представление, хотя бы теоретическое, может сразу перейти к разделу “Вытесняющий планировщик”.
+
+
+Простейший невытесняющий планировщик
+
+Представим, что у нас есть несколько задач, достаточно коротких по времени, и мы можем их вызывать поочередно. Задачу оформим как обычную функцию с некоторым набором параметров. Планировщик будет оперировать массивом структур на эти функции. Он будет проходиться по этому массиву и вызывать функции-задачи с заданными параметрами. Функция, выполнив необходимые действия для задачи, вернет управление в основной цикл планировщика.
+
+
+#include <stdio.h> #define TASK_COUNT 2 struct task { void (*func)(void *); void *data; }; static struct task tasks[TASK_COUNT]; static void scheduler(void) { int i; for (i = 0; i < TASK_COUNT; i++) { tasks[i].func(tasks[i].data); } } static void worker(void *data) { printf("%s\n", (char *) data); } static struct task *task_create(void (*func)(void *), void *data) { static int i = 0; tasks[i].func = func; tasks[i].data = data; return &tasks[i++]; } int main(void) { task_create(&worker, "First"); task_create(&worker, "Second"); scheduler(); return 0; }
+
+
+
+Результаты вывода:
+
+First
+Second
+
+
+График занятости процессора:
+
+
+
+
+Невытесняющий планировщик на основе событий
+
+Понятно, что описанный выше пример слишком уж примитивен. Давайте введем еще возможность активировать определенную задачу. Для этого в структуру описания задачи нужно добавить флаг, указывающий на то, активна задача или нет. Конечно, еще понадобится небольшое API для управления активизацией.
+
+
+#include <stdio.h> #define TASK_COUNT 2 struct task { void (*func)(void *); void *data; int activated; }; static struct task tasks[TASK_COUNT]; struct task_data { char *str; struct task *next_task; }; static struct task *task_create(void (*func)(void *), void *data) { static int i = 0; tasks[i].func = func; tasks[i].data = data; return &tasks[i++]; } static int task_activate(struct task *task, void *data) { task->data = data; task->activated = 1; return 0; } static int task_run(struct task *task, void *data) { task->activated = 0; task->func(data); return 0; } static void scheduler(void) { int i; int fl = 1; while (fl) { fl = 0; for (i = 0; i < TASK_COUNT; i++) { if (tasks[i].activated) { fl = 1; task_run(&tasks[i], tasks[i].data); } } } } static void worker1(void *data) { printf("%s\n", (char *) data); } static void worker2(void *data) { struct task_data *task_data; task_data = data; printf("%s\n", task_data->str); task_activate(task_data->next_task, "First activated"); } int main(void) { struct task *t1, *t2; struct task_data task_data; t1 = task_create(&worker1, "First create"); t2 = task_create(&worker2, "Second create"); task_data.next_task = t1; task_data.str = "Second activated"; task_activate(t2, &task_data); scheduler(); return 0; }
+
+
+
+Результаты вывода:
+
+Second activated
+First activated
+
+
+График занятости процессора
+
+
+
+
+Невытесняющий планировщик на основе очереди сообщений
+
+Проблемы предыдущего метода очевидны: если кто-то захочет два раза активировать некую задачу, пока задача не обработана, то у него это не получится. Информация о второй активации просто потеряется. Эту проблему можно частично решить с помощью очереди сообщений. Добавим вместо флажков массив, в котором хранятся очереди сообщений для каждого потока.
+
+
+#include <stdio.h> #include <stdlib.h> #define TASK_COUNT 2 struct message { void *data; struct message *next; }; struct task { void (*func)(void *); struct message *first; }; struct task_data { char *str; struct task *next_task; }; static struct task tasks[TASK_COUNT]; static struct task *task_create(void (*func)(void *), void *data) { static int i = 0; tasks[i].func = func; tasks[i].first = NULL; return &tasks[i++]; } static int task_activate(struct task *task, void *data) { struct message *msg; msg = malloc(sizeof(struct message)); msg->data = data; msg->next = task->first; task->first = msg; return 0; } static int task_run(struct task *task, void *data) { struct message *msg = data; task->first = msg->next; task->func(msg->data); free(data); return 0; } static void scheduler(void) { int i; int fl = 1; struct message *msg; while (fl) { fl = 0; for (i = 0; i < TASK_COUNT; i++) { while (tasks[i].first) { fl = 1; msg = tasks[i].first; task_run(&tasks[i], msg); } } } } static void worker1(void *data) { printf("%s\n", (char *) data); } static void worker2(void *data) { struct task_data *task_data; task_data = data; printf("%s\n", task_data->str); task_activate(task_data->next_task, "Message 1 to first"); task_activate(task_data->next_task, "Message 2 to first"); } int main(void) { struct task *t1, *t2; struct task_data task_data; t1 = task_create(&worker1, "First create"); t2 = task_create(&worker2, "Second create"); task_data.next_task = t1; task_data.str = "Second activated"; task_activate(t2, &task_data); scheduler(); return 0; }
+
+
+
+Результаты работы:
+
+Second activated
+Message 2 to first
+Message 1 to first
+
+
+График занятости процессора
+
+
+
+
+Невытесняющий планировщик с сохранением порядка вызовов
+
+Еще одна проблема у предыдущих примеров в том, что не сохраняется порядок активизации задач. По сути дела, каждой задачи присвоен свой приоритет, это не всегда хорошо. Для решения этой проблемы можно создать одну очередь сообщений и диспетчер, который будет ее разбирать.
+
+
+#include <stdio.h> #include <stdlib.h> #define TASK_COUNT 2 struct task { void (*func)(void *); void *data; struct task *next; }; static struct task *first = NULL, *last = NULL; static struct task *task_create(void (*func)(void *), void *data) { struct task *task; task = malloc(sizeof(struct task)); task->func = func; task->data = data; task->next = NULL; if (last) { last->next = task; } else { first = task; } last = task; return task; } static int task_run(struct task *task, void *data) { task->func(data); free(task); return 0; } static struct task *task_get_next(void) { struct task *task = first; if (!first) { return task; } first = first->next; if (first == NULL) { last = NULL; } return task; } static void scheduler(void) { struct task *task; while ((task = task_get_next())) { task_run(task, task->data); } } static void worker2(void *data) { printf("%s\n", (char *) data); } static void worker1(void *data) { printf("%s\n", (char *) data); task_create(worker2, "Second create"); task_create(worker2, "Second create again"); } int main(void) { struct task *t1; t1 = task_create(&worker1, "First create"); scheduler(); return 0; }
+
+
+
+Результаты работы:
+
+First create
+Second create
+Second create again
+
+
+График занятости процессора
+
+
+
+Прежде чем перейти к вытесняющему планировщику, хочу добавить, что невытесняющий планировщик используется в реальных системах, поскольку затраты на переключение задач минимальные. Правда этот подход требует большого внимания со стороны программиста, он должен самостоятельно следить за тем, чтобы задачи не зациклились во время исполнения.
+
+
+Вытесняющий планировщик
+
+Теперь давайте представим следующую картину. У нас есть два вычислительных потока, выполняющих одну и ту же программу, и есть планировщик, который в произвольный момент времени перед выполнением любой инструкции может прервать активный поток и активировать другой. Для управления подобными задачами уже недостаточно информации только о функции вызова потока и ее параметрах, как в случае с невытесняющими планировщиками. Как минимум, еще нужно знать адрес текущей выполняемой инструкции и набор локальных переменных для каждой задачи. То есть для каждой задачи нужно хранить копии соответствующих переменных, а так как локальные переменные для потоков располагаются на его стеке, то должно быть выделено пространство под стек каждого потока, и где-то должен храниться указатель на текущее положение стека.
+
+Эти данные — instruction pointer и stack pointer — хранятся в регистрах процессора. Кроме них для корректной работы необходима и другая информация, содержащаяся в регистрах: флаги состояния, различные регистры общего назначения, в которых содержатся временные переменные, и так далее. Все это называется контекстом процессора.
+
+
+Контекст процессора
+
+Контекст процессора (CPU context) — это структура данных, которая хранит внутреннее состояние регистров процессора. Контекст должен позволять привести процессор в корректное состояние для выполнения вычислительного потока. Процесс замены одного вычислительного потока другим принято называть переключением контекста (context switch).
+
+Описание структуры контекста для архитектуры x86 из нашего проекта:
+
+struct context { /* 0x00 */uint32_t eip; /**< instruction pointer */ /* 0x04 */uint32_t ebx; /**< base register */ /* 0x08 */uint32_t edi; /**< Destination index register */ /* 0x0c */uint32_t esi; /**< Source index register */ /* 0x10 */uint32_t ebp; /**< Stack pointer register */ /* 0x14 */uint32_t esp; /**< Stack Base pointer register */ /* 0x18 */uint32_t eflags; /**< EFLAGS register hold the state of the processor */ };
+
+
+Понятия контекста процессора и переключения контекста — основополагающие в понимании принципа вытесняющего планирования.
+
+
+Переключение контекста
+
+Переключение контекста — замена контекста одного потока другим. Планировщик сохраняет текущий контекст и загружает в регистры процессора другой.
+Выше я говорила, что планировщик может прервать активный поток в любой момент времени, что несколько упрощает модель. На самом же деле не планировщик прерывает поток, а текущая программа прерывается процессором в результате реакции на внешнее событие — аппаратное прерывание — и передает управление планировщику. Например, внешним событием является системный таймер, который отсчитывает квант времени, выделенный для работы активного потока. Если считать, что в системе существует ровно один источник прерывания, системный таймер, то карта процессорного времени будет выглядеть следующим образом:
+
+Процедура переключения контекста для архитектуры x86:
+
+.global context_switch context_switch: movl 0x04(%esp), %ecx /* Point ecx to previous registers */ movl (%esp), %eax /* Get return address */ movl %eax, CTX_X86_EIP(%ecx) /* Save it as eip */ movl %ebx, CTX_X86_EBX(%ecx) /* Save ebx */ movl %edi, CTX_X86_EDI(%ecx) /* Save edi */ movl %esi, CTX_X86_ESI(%ecx) /* Save esi */ movl %ebp, CTX_X86_EBP(%ecx) /* Save ebp */ add $4, %esp /* Move esp in state corresponding to eip */ movl %esp, CTX_X86_ESP(%ecx) /* Save esp */ pushf /* Push flags */ pop CTX_X86_EFLAGS(%ecx) /* ...and save them */ movl 0x04(%esp), %ecx /* Point ecx to next registers */ movl CTX_X86_EBX(%ecx), %ebx /* Restore ebx */ movl CTX_X86_EDI(%ecx), %edi /* Restore edi */ movl CTX_X86_ESP(%ecx), %esi /* Restore esp */ movl CTX_X86_EBP(%ecx), %ebp /* Restore ebp */ movl CTX_X86_ESP(%ecx), %esp /* Restore esp */ push CTX_X86_EFLAGS(%ecx) /* Push saved flags */ popf /* Restore flags */ movl CTX_X86_EIP(%ecx), %eax /* Get eip */ push %eax /* Restore it as return address */ ret
+
+
+
+Машина состояний потока
+
+Мы обсудили важное отличие структуры потока в случае с вытесняющим планировщиком от случая с невытесняющим планировщиком — наличие контекста. Посмотрим, что происходит с потоком с момента его создания до завершения:
+
+
+
+Состояния init отвечает за то, что поток создан, но не добавлялся еще в очередь к планировщику, а exit говорит о том, что поток завершил свое исполнение, но еще не освободил выделенную ему память.
+Состояние run тоже должно быть очевидно — поток в таком состоянии исполняется на процессоре.
+Состояние ready же говорит о том, что поток не исполняется, но ждет, когда планировщик предоставит ему время, то есть находится в очереди планировщика.
+
+Но этим не исчерпываются возможные состояния потока. Поток может отдать квант времени в ожидании какого-либо события, например, просто заснуть на некоторое время и по истечении этого времени продолжить выполнение с того места, где он заснул (например, обычный вызов sleep).
+Таким образом, поток может находиться в разных состояниях (готов к выполнению, завершается, находиться в режиме ожидания и так далее), тогда как в случае с невытесняющим планировщиком достаточно было иметь флаг об активности той или иной задачи.
+
+Вот так можно представить обобщенную машину состояний:
+
+В этой схеме появилось новое состояние wait, которое говорит планировщику о том, что поток уснул, и пока он не проснется, процессорное время ему выделять не нужно.
+Теперь рассмотрим поподробнее API управления потоком, а также углубим свои знания о состояниях потока.
+
+
+Реализация состояний
+
+Если посмотреть на схему состояний внимательнее, то можно увидеть, что состояния init и wait почти не отличаются: оба могут перейти только в состояние ready, то есть сказать планировщику, что они готовы получить свой квант времени. Таким образом состояние init избыточное.
+
+Теперь посмотрим на состояние exit. У этого состояния есть свои тонкости. Оно выставляется планировщику в завершающей функции, о ней речь пойдет ниже. Завершение потока может проходить по двум сценариям: первый — поток завершает свою основную функцию и освобождает занятые им ресурсы, второй — другой поток берет на себя ответственность по освобождению ресурсов. Во втором случае поток видит, что другой поток освободит его ресурсы, сообщает ему о том, что завершился, и передает управление планировщику. В первом случае поток освобождает ресурсы и также передает управление планировщику. После того, как планировщик получил управление, поток никогда не должен возобновить работу. То есть в обоих случаях состояние exit имеет одно и то же значение — поток в этом состоянии не хочет получить новый квант времени, его не нужно помещать в очередь планировщика. Идейно это также ничем не отличается от состояния wait, так что можно не заводить отдельное состояние.
+
+Таким образом, у нас остается три состояния. Мы будем хранить эти состояния в трех отдельных полях. Можно было бы хранить все в одном целочисленном поле, но для упрощения проверок и в силу особенности многопроцессорного случая, который здесь мы обсуждать не будем, было принято такое решение. Итак, состояния потока:
+
+
+active — запущен и исполняется на процессоре
+waiting — ожидает какого-то события. Кроме того заменяет собой состояния init и exit
+ready — находится под управлением планировщика, т.е. лежит в очереди готовых потоков в планировщике или запущен на процессоре. Это состояние несколько шире того ready, что мы видим на картинке. В большинстве случаев active и ready, а ready и waiting теоретически ортогональны, но есть специфичные переходные состояния, где эти правила нарушаются. Про эти случаи я расскажу ниже.
+
+
+
+Создание
+
+Создание потока включает в себя необходимую инициализацию (функция thread_init) и возможный запуск потока. При инициализации выделяется память для стека, задается контекст процессора, выставляются нужные флаги и прочие начальные значения. Поскольку при создании мы работаем с очередью готовых потоков, которую использует планировщик в произвольное время, мы должны заблокировать работу планировщика со структурой потока, пока вся структура не будет инициализирована полностью. После инициализации поток оказывается в состоянии waiting, которое, как мы помним, в том числе отвечает и за начальное состояние. После этого, в зависимости от переданных параметров, либо запускаем поток, либо нет. Функция запуска потока — это функция запуска/пробуждения в планировщике, она подробно описана ниже. Сейчас же скажем только, что эта функция помещает поток в очередь планировщика и меняет состояние waiting на ready.
+Итак, код функции thread_create и thread_init:
+
+
+struct thread *thread_create(unsigned int flags, void *(*run)(void *), void *arg) { int ret; struct thread *t; //… /* below we are going work with thread instances and therefore we need to * lock the scheduler (disable scheduling) to prevent the structure being * corrupted */ sched_lock(); { /* allocate memory */ if (!(t = thread_alloc())) { t = err_ptr(ENOMEM); goto out; } /* initialize internal thread structure */ thread_init(t, flags, run, arg); //… } out: sched_unlock(); return t; }
+
+
+
+void thread_init(struct thread *t, unsigned int flags, void *(*run)(void *), void *arg) { sched_priority_t priority; assert(t); assert(run); assert(thread_stack_get(t)); assert(thread_stack_get_size(t)); t->id = id_counter++; /* setup thread ID */ dlist_init(&t->thread_link); /* default unlink value */ t->critical_count = __CRITICAL_COUNT(CRITICAL_SCHED_LOCK); t->siglock = 0; t->lock = SPIN_UNLOCKED; t->ready = false; t->active = false; t->waiting = true; t->state = TS_INIT; /* set executive function and arguments pointer */ t->run = run; t->run_arg = arg; t->joining = NULL; //... /* cpu context init */ context_init(&t->context, true); /* setup default value of CPU registers */ context_set_entry(&t->context, thread_trampoline);/*set entry (IP register*/ /* setup stack pointer to the top of allocated memory * The structure of kernel thread stack follow: * +++++++++++++++ top * | * v * the thread structure * xxxxxxx * the end * +++++++++++++++ bottom (t->stack - allocated memory for the stack) */ context_set_stack(&t->context, thread_stack_get(t) + thread_stack_get_size(t)); sigstate_init(&t->sigstate); /* Initializes scheduler strategy data of the thread */ runq_item_init(&t->sched_attr.runq_link); sched_affinity_init(t); sched_timing_init(t); }
+
+
+
+Режим ожидания
+
+Поток может отдать свое время другому потоку по каким-либо причинам, например, вызвав функцию sleep. То есть текущий поток переходит из рабочего режима в режим ожидания. Если в случае с невытесняющим планировщиком мы просто ставили флаг активности, то здесь мы сохраним наш поток в другой очереди. Ждущий поток не кладется в очередь планировщика. Чтобы не потерять поток, он, как правило, сохраняется в специальную очередь. Например, при попытке захватить занятый мьютекс поток, перед тем как заснуть, помещает себя в очередь ждущих потоков мьютекса. И когда произойдет событие, которое ожидает поток, например, освобождение мьютекса, оно его разбудит и мы сможем вернуть поток обратно в очередь готовых. Подробнее про ожидание и подводные камни расскажем ниже, уже после того, как разберемся с кодом самого планировщика.
+
+
+Завершение потока
+
+Здесь поток оказывается в завершающем состоянии wait. Если поток выполнил функцию обработки и завершился естественным образом, необходимо освободить ресурсы. Про этот процесс я уже подробно описала, когда говорила об избыточности состояния exit. Посмотрим же теперь на реализацию этой функции.
+
+
+void __attribute__((noreturn)) thread_exit(void *ret) { struct thread *current = thread_self(); struct task *task = task_self(); struct thread *joining; /* We can not free the main thread */ if (task->main_thread == current) { /* We are last thread. */ task_exit(ret); /* NOTREACHED */ } sched_lock(); current->waiting = true; current->state |= TS_EXITED; /* Wake up a joining thread (if any). * Note that joining and run_ret are both in a union. */ joining = current->joining; if (joining) { current->run_ret = ret; sched_wakeup(joining); } if (current->state & TS_DETACHED) /* No one references this thread anymore. Time to delete it. */ thread_delete(current); schedule(); /* NOTREACHED */ sched_unlock(); /* just to be honest */ panic("Returning from thread_exit()"); }
+
+
+
+Трамплин для вызова функции обработки
+
+Мы уже не раз говорили, что, когда поток завершает исполнение, он должен освободить ресурсы. Вызывать функцию thread_exit самостоятельно не хочется — очень редко нужно завершить поток в исключительном порядке, а не естественным образом, после выполнения своей функции. Кроме того, нам нужно подготовить начальный контекст, что тоже делать каждый раз — излишне. Поэтому поток начинает не с той функции, что мы указали при создании, а с функции-обертки thread_trampoline. Она как раз служит для подготовки начального контекста и корректного завершения потока.
+
+
+static void __attribute__((noreturn)) thread_trampoline(void) { struct thread *current = thread_self(); void *res; assert(!critical_allows(CRITICAL_SCHED_LOCK), "0x%x", (uint32_t)__critical_count); sched_ack_switched(); assert(!critical_inside(CRITICAL_SCHED_LOCK)); /* execute user function handler */ res = current->run(current->run_arg); thread_exit(res); /* NOTREACHED */ }
+
+
+
+Резюме: описание структуры потока
+
+Итак, для описания задачи в случае с вытесняющим планировщиком нам понадобится достаточно сложная структура. Она содержит в себе:
+
+информацию о регистрах процессора (контексте).
+информацию о состоянии задачи, готова ли она к выполнению или, например, ждет освобождения какого-либо ресурса.
+идентификатор. В случае с массивом это индекс в массиве, но если потоки могут добавляться и удаляться, то лучше использовать очередь, где идентификаторы и пригодятся.
+функцию старта и ее аргументы, возможно, даже и возвращаемый результат.
+адрес куска памяти, который выделен под стек, поскольку при выходе из потока его нужно освободить.
+
+
+Cоотвественно, описание структуры у нас в проекте выглядит следующим образом:
+
+struct thread { unsigned int critical_count; unsigned int siglock; spinlock_t lock; /**< Protects wait state and others. */ unsigned int active; /**< Running on a CPU. TODO SMP-only. */ unsigned int ready; /**< Managed by the scheduler. */ unsigned int waiting; /**< Waiting for an event. */ unsigned int state; /**< Thread-specific state. */ struct context context; /**< Architecture-dependent CPU state. */ void *(*run)(void *); /**< Start routine. */ void *run_arg; /**< Argument to pass to start routine. */ union { void *run_ret; /**< Return value of the routine. */ void *joining; /**< A joining thread (if any). */ } /* unnamed */; thread_stack_t stack; /**< Handler for work with thread stack */ __thread_id_t id; /**< Unique identifier. */ struct task *task; /**< Task belong to. */ struct dlist_head thread_link; /**< list's link holding task threads. */ struct sigstate sigstate; /**< Pending signal(s). */ struct sched_attr sched_attr; /**< Scheduler-private data. */ thread_local_t local; thread_cancel_t cleanups; };
+
+В структуре есть поля не описанные в статье (sigstate, local, cleanups) они нужны для поддержки полноценных POSIX потоков (pthread) и в рамках данной статьи не принципиальны.
+
+
+Планировщик и стратегия планирования
+
+Напомним, что теперь у нас есть структура потока, включающая в том числе контекст, этот контекст мы умеем переключать. Кроме того, у нас есть системный таймер, который отмеряет кванты времени. Иными словами, у нас готово окружение для работы планировщика.
+Задача планировщика — распределять время процессора между потоками. У планировщика есть очередь готовых потоков, которой он оперирует для определения следующего активного потока. Правила, по которым планировщик выбирает очередной поток для исполнения, будем называть стратегией планирования. Основная функция стратегии планирования — работа с очередью готовых потоков: добавление, удаление и извлечение следующего готового потока. От того, как будут реализованы эти функции, будет зависеть поведение планировщика. Поскольку мы смогли определить отдельное понятие — стратегию планирования, вынесем его в отдельную сущность. Интерфейс мы описали следующим образом:
+
+
+extern void runq_init(runq_t *queue); extern void runq_insert(runq_t *queue, struct thread *thread); extern void runq_remove(runq_t *queue, struct thread *thread); extern struct thread *runq_extract(runq_t *queue); extern void runq_item_init(runq_item_t *runq_link);
+
+
+Рассмотрим реализацию стратегии планирования поподробнее.
+
+Пример стратегии планирования
+
+В качестве примера я разберу самую примитивную стратегию планирования, чтобы сосредоточиться не на тонкостях стратегии, а на особенностях вытесняющего планировщика. Потоки в этой стратегии буду обрабатываться в порядке очереди без учета приоритета: новый поток и только что отработавший свой квант помещаются в конец; поток, который получит ресурсы процессора, будет доставаться из начала.
+Очередь будет представлять из себя обычный двусвязный список. Когда мы добавляем элемент, мы вставляем его в конец, а когда достаем — берем и удаляем из начала.
+
+
+void runq_item_init(runq_item_t *runq_link) { dlist_head_init(runq_link); } void runq_init(runq_t *queue) { dlist_init(queue); } void runq_insert(runq_t *queue, struct thread *thread) { dlist_add_prev(&thread->sched_attr.runq_link, queue); } void runq_remove(runq_t *queue, struct thread *thread) { dlist_del(&thread->sched_attr.runq_link); } struct thread *runq_extract(runq_t *queue) { struct thread *thread; thread = dlist_entry(queue->next, struct thread, sched_attr.runq_link); runq_remove(queue, thread); return thread; }
+
+
+
+Планировщик
+
+Теперь мы перейдем к самому интересному — описанию планировщика.
+
+
+Запуск планировщика
+
+Первый этап работы планировщика — его инициализация. Здесь нам необходимо обеспечить корректное окружение планировщику. Нужно подготовить очередь готовых потоков, добавить в эту очередь поток idle и запустить таймер, по которому будут отсчитываться кванты времени для исполнения потоков.
+Код запуска планировщика:
+
+int sched_init(struct thread *idle, struct thread *current) { runq_init(&rq.queue); rq.lock = SPIN_UNLOCKED; sched_wakeup(idle); sched_ticker_init(); return 0; }
+
+
+
+Пробуждение и запуск потока
+
+Как мы помним из описания машины состояний, пробуждение и запуск потока для планировщика — это один и тот же процесс. Вызов этой функции есть в запуске планировщика, там мы запускаем поток idle. Что, по сути дела, происходит при пробуждении? Во-первых, снимается пометка о том, что мы ждем, то есть поток больше не находится в состоянии waiting. Затем возможны два варианта: успели мы уже уснуть или еще нет. Почему это происходит, я опишу в следующем разделе “Ожидание”. Если не успели, то поток еще находится в состоянии ready, и в таком случае пробуждение завершено. Иначе мы кладем поток в очередь планировщика, снимаем пометку о состоянии waiting, ставим ready. Кроме того, вызывается перепланирование, если приоритет пробужденного потока больше текущего. Обратите внимание на различные блокировки: все действо происходит при отключенных прерываниях. Для того, чтобы посмотреть, как пробуждение и запуск потока происходит в случае SMP, советую вам обратиться к коду проекта.
+
+
+/** Locks: IPL, thread. */ static int __sched_wakeup_ready(struct thread *t) { int ready; spin_protected_if (&rq.lock, (ready = t->ready)) t->waiting = false; return ready; } /** Locks: IPL, thread. */ static void __sched_wakeup_waiting(struct thread *t) { assert(t && t->waiting); spin_lock(&rq.lock); __sched_enqueue_set_ready(t); __sched_wokenup_clear_waiting(t); spin_unlock(&rq.lock); } static inline void __sched_wakeup_smp_inactive(struct thread *t) { __sched_wakeup_waiting(t); } /** Called with IRQs off and thread lock held. */ int __sched_wakeup(struct thread *t) { int was_waiting = (t->waiting && t->waiting != TW_SMP_WAKING); if (was_waiting) if (!__sched_wakeup_ready(t)) __sched_wakeup_smp_inactive(t); return was_waiting; } int sched_wakeup(struct thread *t) { assert(t); return SPIN_IPL_PROTECTED_DO(&t->lock, __sched_wakeup(t)); }
+
+
+
+Ожидание
+
+Переход в режим ожидания и правильный выход из него (когда ожидаемое событие, наконец, случится), вероятно, самая сложная и тонкая вещь в вытесняющем планировании. Давайте рассмотрим ситуацию поподробнее.
+Прежде всего, мы должны объяснить планировщику, что мы хотим дождаться какого-либо события, причем событие происходит естественно асинхронного, а нам нужно его получить синхронно. Следовательно, мы должны указать, как же планировщик определит, что событие произошло. При этом мы не знаем, когда оно может произойти, например, мы успели сказать планировщику, что ждем события, проверили, что условия его возникновения еще не выполнены, и в этот момент происходит аппаратное прерывание, которое и вырабатывает наше событие. Но поскольку мы уже выполнили проверку, то эта информация потеряется. У нас в проекте мы решили данную проблему следующим образом.
+Код макроса ожидания
+
+#define SCHED_WAIT_TIMEOUT(cond_expr, timeout) \ ((cond_expr) ? 0 : ({ \ int __wait_ret = 0; \ clock_t __wait_timeout = timeout == SCHED_TIMEOUT_INFINITE ? \ SCHED_TIMEOUT_INFINITE : ms2jiffies(timeout); \ \ threadsig_lock(); \ do { \ sched_wait_prepare(); \ \ if (cond_expr) \ break; \ \ __wait_ret = sched_wait_timeout(__wait_timeout, \ &__wait_timeout); \ } while (!__wait_ret); \ \ sched_wait_cleanup(); \ \ threadsig_unlock(); \ __wait_ret; \ }))
+
+
+Поток у нас может находиться сразу в суперпозиции состояний. То есть когда поток засыпает, он все еще является активным и всего лишь выставляет дополнительный флаг waiting. Во время пробуждения опять же просто снимается этот флаг, и только если поток уже успел дойти до планировщика и покинуть очередь готовых потоков, он добавляется туда снова. Если рассмотреть описанную ранее ситуацию на картинке, то получится следующая картина.
+
+A — active
+R — ready
+W — wait
+
+На картинке буквами обозначено наличие состояний. Светло-зеленый цвет — состояние потока до wait_prepare, зеленый — после wait_prepare, а темно-зеленый — вызов потоком перепланирования.
+Если событие не успеет произойти до перепланирования, то все просто — поток уснет и будет ждать пробуждения:
+
+
+
+Перепланирование
+
+Основная задача планировщика — планирование, прошу прощения за тавтологию. И мы наконец подошли к моменту когда можно разобрать как этот процесс реализован у нас в проекте.
+Во-первых перепланирование должно выполняться при заблокированном планировщике. Во-вторых мы хотим дать возможность разрешить вытеснение потока или нет. Поэтому мы вынесли логику работы в отдельную функцию окружили ее вызов блокировками и вызвали ее указав, что в этом месте мы не позволяем вытеснение.
+Далее идут действия с очередью готовых потоков. Если активный на момент перепланирования потока не собирается уснуть, то есть если у него не выставлено состояние waiting, мы просто добавим его в очередь потоков планировщика. Затем мы достаем самый приоритетный поток из очереди. Правила нахождения этого потока реализуются с помощью стратегии планирования.
+Затем если текущий активный поток совпадает с тем который мы достали из очереди, нам не нужно перепланирование и мы можем просто выйти и продолжить выполнение потока. В случае же если требуется перепланирование, вызывается функция sched_switch, в которой выполняются действия необходимые планировщику и главное вызывается context_switch который мы рассматривали выше.
+Если же поток собирается уснуть, находится в состоянии waiting, то он не попадает в очередь планировщика, и с него снимают метку ready.
+В конце происходит обработка сигналов, но как я отмечала выше, это выходит за рамки данной статьи.
+
+
+static void sched_switch(struct thread *prev, struct thread *next) { sched_prepare_switch(prev, next); trace_point(__func__); /* Preserve initial semantics of prev/next. */ cpudata_var(saved_prev) = prev; thread_set_current(next); context_switch(&prev->context, &next->context); /* implies cc barrier */ prev = cpudata_var(saved_prev); sched_finish_switch(prev); } static void __schedule(int preempt) { struct thread *prev, *next; ipl_t ipl; prev = thread_self(); assert(!sched_in_interrupt()); ipl = spin_lock_ipl(&rq.lock); if (!preempt && prev->waiting) prev->ready = false; else __sched_enqueue(prev); next = runq_extract(&rq.queue); spin_unlock(&rq.lock); if (prev != next) sched_switch(prev, next); ipl_restore(ipl); assert(thread_self() == prev); if (!prev->siglock) { thread_signal_handle(); } } void schedule(void) { sched_lock(); __schedule(0); sched_unlock(); }
+
+
+
+Проверка работы многопоточности
+
+В качестве примера я использовала следующий код:
+
+#include <stdint.h> #include <errno.h> #include <stdio.h> #include <util/array.h> #include <kernel/thread.h> #include <framework/example/self.h> /** * This macro is used to register this example at the system. */ EMBOX_EXAMPLE(run); /* configs */ #define CONF_THREADS_QUANTITY 0x8 /* number of executing threads */ #define CONF_HANDLER_REPEAT_NUMBER 300 /* number of circle loop repeats*/ /** The thread handler function. It's used for each started thread */ static void *thread_handler(void *args) { int i; /* print a thread structure address and a thread's ID */ for(i = 0; i < CONF_HANDLER_REPEAT_NUMBER; i ++) { printf("%d", *(int *)args); } return thread_self(); } /** * Example's executing routine * It has been declared by the macro EMBOX_EXAMPLE */ static int run(int argc, char **argv) { struct thread *thr[CONF_THREADS_QUANTITY]; int data[CONF_THREADS_QUANTITY]; void *ret; int i; /* starting all threads */ for(i = 0; i < ARRAY_SIZE(thr); i ++) { data[i] = i; thr[i] = thread_create(0, thread_handler, &data[i]); } /* waiting until all threads finish and print return value*/ for(i = 0; i < ARRAY_SIZE(thr); i ++) { thread_join(thr[i], &ret); } printf("\n"); return ENOERR; }
+
+
+Собственно, это почти обычное приложение. Макрос EMBOX_EXAMPLE(run) задает точку входа в специфичный тип наших модулей. Функция thread_join дожидается завершения потока, пока я ее тоже не рассматривала. И так уже очень много получилось для одной статьи.
+Результат запуска этого примера на qemu в составе нашего проекта следующий
+
+
+Как видно из результатов, сначала созданные потоки выполняются один за другим, планировщик дает им время по очереди. В конце некоторое расхождение. Я думаю, это следствие того, что у планировщика достаточно грубая точность (не сопоставимая с выводом одного символа на экран). Поэтому на первых проходах потоки успевают выполнить разное количество циклов.
+В общем, кто хочет поиграться, можно скачать проект и попробовать все вышеописанное на практике.
+Если тема интересна, я попробую продолжить рассказ о планировании, еще достаточно много тем осталось не раскрытыми.
